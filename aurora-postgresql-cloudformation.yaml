@@ -334,6 +334,7 @@ Resources:
               - Effect: Allow
                 Action:
                   - rds:AddTagsToResource
+                  - rds:DescribeDBClusters
                 Resource: '*'
 
   SetTerminationDateTimeFunction:
@@ -349,14 +350,34 @@ Resources:
           import json
           import cfnresponse
           from datetime import datetime, timedelta
+          import time
           
           def lambda_handler(event, context):
               try:
                   if event['RequestType'] == 'Create':
                       rds = boto3.client('rds')
                       
-                      cluster_arn = event['ResourceProperties']['ClusterArn']
+                      cluster_id = event['ResourceProperties']['ClusterIdentifier']
+                      region = event['ResourceProperties']['Region']
+                      account_id = event['ResourceProperties']['AccountId']
                       termination_hours = int(event['ResourceProperties']['TerminationHours'])
+                      
+                      # Wait for cluster to be available
+                      max_attempts = 30
+                      for attempt in range(max_attempts):
+                          try:
+                              response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                              cluster = response['DBClusters'][0]
+                              if cluster['Status'] == 'available':
+                                  cluster_arn = cluster['DBClusterArn']
+                                  break
+                              print(f"Cluster status: {cluster['Status']}, waiting...")
+                              time.sleep(30)
+                          except Exception as e:
+                              print(f"Attempt {attempt + 1}: {str(e)}")
+                              if attempt == max_attempts - 1:
+                                  raise
+                              time.sleep(30)
                       
                       # Calculate termination datetime
                       termination_datetime = datetime.utcnow() + timedelta(hours=termination_hours)
@@ -382,9 +403,12 @@ Resources:
 
   SetTerminationDateTime:
     Type: AWS::CloudFormation::CustomResource
+    DependsOn: AuroraInstance
     Properties:
       ServiceToken: !GetAtt SetTerminationDateTimeFunction.Arn
-      ClusterArn: !Sub 'arn:aws:rds:${Region}:${AWS::AccountId}:cluster:${AuroraCluster}'
+      ClusterIdentifier: !Ref AuroraCluster
+      Region: !Ref Region
+      AccountId: !Ref AWS::AccountId
       TerminationHours: !Ref TerminationHours
 
 Outputs:

@@ -1,0 +1,1 @@
+{"statusCode": 200, "body": "{\"message\": \"Processed 0 instances for termination\", \"instances_found\": [\"i-075c80045488ebb4b\"], \"instances_terminated\": [], \"current_time\": \"2025-08-11 07:34:48.194661+00:00\", \"total_reservations\": 1, \"total_instances\": 1}"}

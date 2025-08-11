@@ -131,6 +131,7 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt AutoTerminationRole.Arn
+      Timeout: 300
       Code:
         ZipFile: |
           import boto3
@@ -138,47 +139,110 @@ Resources:
           from datetime import datetime, timezone
           
           def lambda_handler(event, context):
+              print(f"=== AUTO-TERMINATION LAMBDA STARTED ===")
+              print(f"Event: {json.dumps(event, default=str)}")
+              print(f"Context: {context}")
+              
               ec2 = boto3.client('ec2')
+              current_datetime = datetime.now(timezone.utc)
+              print(f"Current UTC datetime: {current_datetime}")
               
               # Get instances with AutoTerminate tag
-              response = ec2.describe_instances(
-                  Filters=[
-                      {'Name': 'tag:AutoTerminate', 'Values': ['true']},
-                      {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
-                  ]
-              )
+              print("Searching for instances with AutoTerminate=true tag...")
+              try:
+                  response = ec2.describe_instances(
+                      Filters=[
+                          {'Name': 'tag:AutoTerminate', 'Values': ['true']},
+                          {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
+                      ]
+                  )
+                  print(f"Found {len(response['Reservations'])} reservations")
+              except Exception as e:
+                  print(f"ERROR: Failed to describe instances: {str(e)}")
+                  return {'statusCode': 500, 'body': f'Error: {str(e)}'}
               
               instances_to_terminate = []
-              current_datetime = datetime.now(timezone.utc)
+              all_instances_found = []
               
               for reservation in response['Reservations']:
+                  print(f"Processing reservation: {reservation['ReservationId']}")
                   for instance in reservation['Instances']:
                       instance_id = instance['InstanceId']
+                      instance_state = instance['State']['Name']
+                      all_instances_found.append(instance_id)
+                      
+                      print(f"  Instance {instance_id} (state: {instance_state})")
+                      
+                      # Print all tags for debugging
+                      tags = instance.get('Tags', [])
+                      print(f"    Tags: {tags}")
                       
                       # Check termination datetime tag
                       termination_datetime = None
-                      for tag in instance.get('Tags', []):
-                          if tag['Key'] == 'TerminationDateTime':
-                              try:
-                                  termination_datetime = datetime.strptime(tag['Value'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                              except ValueError:
-                                  continue
+                      termination_datetime_str = None
                       
-                      if termination_datetime and current_datetime >= termination_datetime:
+                      for tag in tags:
+                          if tag['Key'] == 'TerminationDateTime':
+                              termination_datetime_str = tag['Value']
+                              print(f"    Found TerminationDateTime tag: {termination_datetime_str}")
+                              try:
+                                  termination_datetime = datetime.strptime(termination_datetime_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                                  print(f"    Parsed termination datetime: {termination_datetime}")
+                              except ValueError as e:
+                                  print(f"    ERROR: Failed to parse datetime '{termination_datetime_str}': {str(e)}")
+                                  continue
+                              break
+                      
+                      if not termination_datetime_str:
+                          print(f"    WARNING: No TerminationDateTime tag found for instance {instance_id}")
+                          continue
+                      
+                      if not termination_datetime:
+                          print(f"    WARNING: Could not parse TerminationDateTime for instance {instance_id}")
+                          continue
+                      
+                      print(f"    Comparing: current={current_datetime} vs termination={termination_datetime}")
+                      time_diff = (termination_datetime - current_datetime).total_seconds()
+                      print(f"    Time difference: {time_diff} seconds ({time_diff/3600:.2f} hours)")
+                      
+                      if current_datetime >= termination_datetime:
                           instances_to_terminate.append(instance_id)
-                          print(f"Instance {instance_id} scheduled for termination at {termination_datetime}, current time: {current_datetime}")
+                          print(f"    ✓ Instance {instance_id} scheduled for termination (expired {-time_diff/3600:.2f} hours ago)")
+                      else:
+                          print(f"    ✗ Instance {instance_id} not ready for termination (expires in {time_diff/3600:.2f} hours)")
+              
+              print(f"Summary:")
+              print(f"  Total instances found: {len(all_instances_found)}")
+              print(f"  Instances to terminate: {len(instances_to_terminate)}")
+              print(f"  Instance IDs found: {all_instances_found}")
+              print(f"  Instance IDs to terminate: {instances_to_terminate}")
               
               # Terminate instances
               if instances_to_terminate:
-                  ec2.terminate_instances(InstanceIds=instances_to_terminate)
-                  print(f"Terminated instances: {instances_to_terminate}")
+                  try:
+                      print(f"Attempting to terminate instances: {instances_to_terminate}")
+                      terminate_response = ec2.terminate_instances(InstanceIds=instances_to_terminate)
+                      print(f"Termination response: {terminate_response}")
+                      print(f"✓ Successfully initiated termination for instances: {instances_to_terminate}")
+                  except Exception as e:
+                      print(f"ERROR: Failed to terminate instances: {str(e)}")
+                      return {'statusCode': 500, 'body': f'Termination failed: {str(e)}'}
               else:
                   print("No instances to terminate at this time")
               
-              return {
+              result = {
                   'statusCode': 200,
-                  'body': json.dumps(f'Processed {len(instances_to_terminate)} instances for termination')
+                  'body': json.dumps({
+                      'message': f'Processed {len(instances_to_terminate)} instances for termination',
+                      'instances_found': all_instances_found,
+                      'instances_terminated': instances_to_terminate,
+                      'current_time': str(current_datetime)
+                  })
               }
+              
+              print(f"=== AUTO-TERMINATION LAMBDA COMPLETED ===")
+              print(f"Result: {result}")
+              return result
 
   # EventBridge rule to trigger Lambda hourly
   AutoTerminationSchedule:
@@ -200,6 +264,74 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AutoTerminationSchedule.Arn
 
+  # Manual invoke function for debugging
+  ManualInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt AutoTerminationFunction.Arn
+
+  ManualInvokeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-manual-invoke'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ManualInvokeRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def lambda_handler(event, context):
+              lambda_client = boto3.client('lambda')
+              
+              # Get the auto-termination function name from environment or event
+              function_name = event.get('function_name', context.function_name.replace('-manual-invoke', '-auto-termination'))
+              
+              print(f"Manually invoking function: {function_name}")
+              
+              try:
+                  response = lambda_client.invoke(
+                      FunctionName=function_name,
+                      InvocationType='RequestResponse',
+                      Payload=json.dumps({'source': 'manual-invoke'})
+                  )
+                  
+                  payload = json.loads(response['Payload'].read())
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Successfully invoked auto-termination function',
+                          'response': payload
+                      })
+                  }
+              except Exception as e:
+                  print(f"Error invoking function: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
 Outputs:
   InstanceId:
     Description: 'G5 Instance ID'
@@ -218,3 +350,15 @@ Outputs:
     Value: !GetAtt G5Instance.PrivateIp
     Export:
       Name: !Sub '${AWS::StackName}-PrivateIP'
+  
+  AutoTerminationFunctionName:
+    Description: 'Auto-termination Lambda function name'
+    Value: !Ref AutoTerminationFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoTerminationFunction'
+  
+  ManualInvokeFunctionName:
+    Description: 'Manual invoke Lambda function name (use this to test auto-termination)'
+    Value: !Ref ManualInvokeFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ManualInvokeFunction'
