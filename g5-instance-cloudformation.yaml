@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'G5 instance with auto-termination after 2 weeks'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: g5.xlarge
+    AllowedValues:
+      - g5.xlarge
+      - g5.2xlarge
+      - g5.4xlarge
+      - g5.8xlarge
+      - g5.12xlarge
+      - g5.16xlarge
+      - g5.24xlarge
+      - g5.48xlarge
+    Description: "G5 instance type (g5.xlarge = $1.00/hr, g5.2xlarge = $1.21/hr, etc.)"
+  
+  KeyPairName:
+    Type: String
+    Default: ""
+    Description: "EC2 Key Pair name for SSH access (optional - leave empty if not needed since SSM is available)"
+  
+  TerminationHours:
+    Type: Number
+    Default: 336
+    MinValue: 1
+    MaxValue: 8760
+    Description: "Hours until auto-termination (336=14days, 168=7days, 24=1day, 2=testing)"
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+Resources:
+  # Security Group
+  G5SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for G5 instance - no ingress allowed
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sg'
+
+  # IAM Role for the instance
+  G5InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-role'
+
+  G5InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref G5InstanceRole
+
+  # G5 Instance
+  G5Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI in us-east-1
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+      SecurityGroupIds:
+        - !Ref G5SecurityGroup
+      IamInstanceProfile: !Ref G5InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y nvidia-driver-latest-dkms
+          yum install -y cuda-drivers
+          
+          # Install NVIDIA Docker
+          distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+          curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo
+          yum install -y nvidia-docker2
+          systemctl restart docker
+          
+          # Set termination datetime based on parameter (hours)
+          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          TERMINATION_DATETIME=$(date -d "+${TerminationHours} hours" '+%Y-%m-%d %H:%M:%S')
+          aws ec2 create-tags --region ${AWS::Region} --resources $INSTANCE_ID --tags Key=TerminationDateTime,Value="$TERMINATION_DATETIME"
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-g5-instance'
+        - Key: AutoTerminate
+          Value: 'true'
+        - Key: CreatedDate
+          Value: !Sub '${AWS::StackName}-created'
+
+  # Lambda function for auto-termination
+  AutoTerminationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2TerminationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+
+  AutoTerminationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auto-termination'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoTerminationRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime, timezone
+          
+          def lambda_handler(event, context):
+              ec2 = boto3.client('ec2')
+              
+              # Get instances with AutoTerminate tag
+              response = ec2.describe_instances(
+                  Filters=[
+                      {'Name': 'tag:AutoTerminate', 'Values': ['true']},
+                      {'Name': 'instance-state-name', 'Values': ['running', 'stopped']}
+                  ]
+              )
+              
+              instances_to_terminate = []
+              current_datetime = datetime.now(timezone.utc)
+              
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      
+                      # Check termination datetime tag
+                      termination_datetime = None
+                      for tag in instance.get('Tags', []):
+                          if tag['Key'] == 'TerminationDateTime':
+                              try:
+                                  termination_datetime = datetime.strptime(tag['Value'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                              except ValueError:
+                                  continue
+                      
+                      if termination_datetime and current_datetime >= termination_datetime:
+                          instances_to_terminate.append(instance_id)
+                          print(f"Instance {instance_id} scheduled for termination at {termination_datetime}, current time: {current_datetime}")
+              
+              # Terminate instances
+              if instances_to_terminate:
+                  ec2.terminate_instances(InstanceIds=instances_to_terminate)
+                  print(f"Terminated instances: {instances_to_terminate}")
+              else:
+                  print("No instances to terminate at this time")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Processed {len(instances_to_terminate)} instances for termination')
+              }
+
+  # EventBridge rule to trigger Lambda hourly
+  AutoTerminationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Hourly check for instances to auto-terminate'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoTerminationFunction.Arn
+          Id: AutoTerminationTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoTerminationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoTerminationSchedule.Arn
+
+Outputs:
+  InstanceId:
+    Description: 'G5 Instance ID'
+    Value: !Ref G5Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceId'
+  
+  PublicIP:
+    Description: 'Public IP of the G5 instance'
+    Value: !GetAtt G5Instance.PublicIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicIP'
+  
+  PrivateIP:
+    Description: 'Private IP of the G5 instance'
+    Value: !GetAtt G5Instance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateIP'
