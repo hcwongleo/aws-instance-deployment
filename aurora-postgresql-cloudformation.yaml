@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Aurora PostgreSQL cluster with auto-termination after 2 weeks'
+
+Parameters:
+  Region:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - eu-west-1
+      - eu-west-2
+      - eu-central-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - ap-southeast-3
+      - ap-east-1
+    Description: "AWS Region for deployment (includes Singapore: ap-southeast-1, Hong Kong: ap-east-1)"
+  
+  DBInstanceClass:
+    Type: String
+    Default: db.r6g.large
+    AllowedValues:
+      - db.r6g.large
+      - db.r6g.xlarge
+      - db.r6g.2xlarge
+      - db.r6g.4xlarge
+      - db.r6g.8xlarge
+      - db.r6g.12xlarge
+      - db.r6g.16xlarge
+    Description: "Aurora instance class (db.r6g.large = ~$0.29/hr, db.r6g.xlarge = ~$0.58/hr, etc.)"
+  
+  MasterUsername:
+    Type: String
+    Default: postgres
+    Description: "Master username for the database"
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+  
+  MasterUserPassword:
+    Type: String
+    NoEcho: true
+    Description: "Master password for the database (8-128 characters)"
+    MinLength: 8
+    MaxLength: 128
+    AllowedPattern: "^[a-zA-Z0-9!@#$%^&*()_+=-]*$"
+  
+  DatabaseName:
+    Type: String
+    Default: mydb
+    Description: "Initial database name"
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]*$"
+  
+  TerminationHours:
+    Type: Number
+    Default: 336
+    MinValue: 1
+    MaxValue: 8760
+    Description: "Hours until auto-termination (336=14days, 168=7days, 24=1day, 2=testing)"
+
+Resources:
+  # VPC and Networking (minimal setup)
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Private Subnets for Aurora
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-2'
+
+  # DB Subnet Group
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora PostgreSQL
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-db-subnet-group'
+
+  # Security Group for Aurora
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Aurora PostgreSQL - no external access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ClientSecurityGroup
+          Description: PostgreSQL access from client security group
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-sg'
+
+  # Client Security Group (for applications that need to connect)
+  ClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for clients connecting to Aurora
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-client-sg'
+
+  # Aurora Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '15.4'
+      MasterUsername: !Ref MasterUsername
+      MasterUserPassword: !Ref MasterUserPassword
+      DatabaseName: !Ref DatabaseName
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      StorageEncrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-cluster'
+        - Key: AutoTerminate
+          Value: 'true'
+        - Key: CreatedDate
+          Value: !Sub '${AWS::StackName}-created'
+
+  # Aurora Instance
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-aurora-instance'
+        - Key: AutoTerminate
+          Value: 'true'
+
+  # Lambda function for auto-termination
+  AutoTerminationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSTerminationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                  - rds:DeleteDBCluster
+                  - rds:DeleteDBInstance
+                  - rds:ListTagsForResource
+                Resource: '*'
+
+  AutoTerminationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-auto-termination'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt AutoTerminationRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime, timezone
+          
+          def lambda_handler(event, context):
+              rds = boto3.client('rds')
+              
+              # Get clusters with AutoTerminate tag
+              clusters_response = rds.describe_db_clusters()
+              
+              clusters_to_terminate = []
+              current_datetime = datetime.now(timezone.utc)
+              
+              for cluster in clusters_response['DBClusters']:
+                  cluster_arn = cluster['DBClusterArn']
+                  cluster_id = cluster['DBClusterIdentifier']
+                  
+                  # Get tags for the cluster
+                  try:
+                      tags_response = rds.list_tags_for_resource(ResourceName=cluster_arn)
+                      tags = {tag['Key']: tag['Value'] for tag in tags_response['TagList']}
+                      
+                      if tags.get('AutoTerminate') == 'true':
+                          # Check termination datetime tag
+                          termination_datetime = None
+                          if 'TerminationDateTime' in tags:
+                              try:
+                                  termination_datetime = datetime.strptime(tags['TerminationDateTime'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                              except ValueError:
+                                  continue
+                          
+                          if termination_datetime and current_datetime >= termination_datetime:
+                              clusters_to_terminate.append(cluster_id)
+                              print(f"Cluster {cluster_id} scheduled for termination at {termination_datetime}, current time: {current_datetime}")
+                  except Exception as e:
+                      print(f"Error processing cluster {cluster_id}: {str(e)}")
+              
+              # Terminate clusters
+              for cluster_id in clusters_to_terminate:
+                  try:
+                      # First delete instances in the cluster
+                      instances_response = rds.describe_db_instances(
+                          Filters=[{'Name': 'db-cluster-id', 'Values': [cluster_id]}]
+                      )
+                      
+                      for instance in instances_response['DBInstances']:
+                          instance_id = instance['DBInstanceIdentifier']
+                          print(f"Deleting instance {instance_id}")
+                          rds.delete_db_instance(
+                              DBInstanceIdentifier=instance_id,
+                              SkipFinalSnapshot=True
+                          )
+                      
+                      # Wait a moment then delete the cluster
+                      print(f"Deleting cluster {cluster_id}")
+                      rds.delete_db_cluster(
+                          DBClusterIdentifier=cluster_id,
+                          SkipFinalSnapshot=True
+                      )
+                      
+                  except Exception as e:
+                      print(f"Error terminating cluster {cluster_id}: {str(e)}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Processed {len(clusters_to_terminate)} clusters for termination')
+              }
+
+  # EventBridge rule to trigger Lambda hourly
+  AutoTerminationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Hourly check for Aurora clusters to auto-terminate'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoTerminationFunction.Arn
+          Id: AutoTerminationTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoTerminationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoTerminationSchedule.Arn
+
+  # Custom Resource to set termination datetime
+  SetTerminationDateTimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSTaggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:AddTagsToResource
+                Resource: '*'
+
+  SetTerminationDateTimeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-set-termination-datetime'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SetTerminationDateTimeRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          from datetime import datetime, timedelta
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      rds = boto3.client('rds')
+                      
+                      cluster_arn = event['ResourceProperties']['ClusterArn']
+                      termination_hours = int(event['ResourceProperties']['TerminationHours'])
+                      
+                      # Calculate termination datetime
+                      termination_datetime = datetime.utcnow() + timedelta(hours=termination_hours)
+                      termination_datetime_str = termination_datetime.strftime('%Y-%m-%d %H:%M:%S')
+                      
+                      # Add termination datetime tag
+                      rds.add_tags_to_resource(
+                          ResourceName=cluster_arn,
+                          Tags=[
+                              {
+                                  'Key': 'TerminationDateTime',
+                                  'Value': termination_datetime_str
+                              }
+                          ]
+                      )
+                      
+                      print(f"Set termination datetime for {cluster_arn}: {termination_datetime_str}")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  SetTerminationDateTime:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SetTerminationDateTimeFunction.Arn
+      ClusterArn: !Sub 'arn:aws:rds:${Region}:${AWS::AccountId}:cluster:${AuroraCluster}'
+      TerminationHours: !Ref TerminationHours
+
+Outputs:
+  ClusterIdentifier:
+    Description: 'Aurora PostgreSQL Cluster Identifier'
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterIdentifier'
+  
+  ClusterEndpoint:
+    Description: 'Aurora PostgreSQL Cluster Endpoint'
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterEndpoint'
+  
+  ClusterPort:
+    Description: 'Aurora PostgreSQL Cluster Port'
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterPort'
+  
+  DatabaseName:
+    Description: 'Database Name'
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+  
+  ClientSecurityGroupId:
+    Description: 'Security Group ID for clients connecting to Aurora'
+    Value: !Ref ClientSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientSecurityGroupId'
+  
+  VPCId:
+    Description: 'VPC ID where Aurora is deployed'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCId'
