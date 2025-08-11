@@ -44,10 +44,11 @@ Parameters:
   MasterUserPassword:
     Type: String
     NoEcho: true
-    Description: "Master password for the database (8-128 characters)"
+    Description: "Master password for the database (8-128 characters). Cannot contain: / @ \" ' (space)"
     MinLength: 8
     MaxLength: 128
-    AllowedPattern: "^[a-zA-Z0-9!@#$%^&*()_+=-]*$"
+    AllowedPattern: "^[a-zA-Z0-9!#$%^&*()_+=\\-\\[\\]{}|;:,.<>?~`]*$"
+    ConstraintDescription: "Password must be 8-128 characters and cannot contain: / @ \" ' (space)"
   
   DatabaseName:
     Type: String
