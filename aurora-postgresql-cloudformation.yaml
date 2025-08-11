@@ -250,7 +250,7 @@ Resources:
                       
                       if tags.get('AutoTerminate') == 'true':
                           # Calculate termination time from cluster creation time + TerminationHours parameter
-                          termination_hours = ${TerminationHours}
+                          termination_hours = int('${TerminationHours}')
                           cluster_create_time = cluster.get('ClusterCreateTime')
                           if cluster_create_time:
                               # Convert to UTC datetime if it's not already

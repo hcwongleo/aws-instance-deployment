@@ -192,7 +192,7 @@ Resources:
                           print(f"    WARNING: AutoTerminate tag not found for instance {instance_id}")
                       
                       # Calculate termination time from launch time + TerminationHours parameter
-                      termination_hours = ${TerminationHours}
+                      termination_hours = int('${TerminationHours}')
                       print(f"    Calculating termination time from launch time + {termination_hours} hours")
                       
                       launch_time = instance.get('LaunchTime')
