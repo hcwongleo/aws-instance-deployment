@@ -1,6 +1,6 @@
 import boto3
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 def lambda_handler(event, context):
     print(f"=== AUTO-TERMINATION LAMBDA STARTED ===")
@@ -58,29 +58,26 @@ def lambda_handler(event, context):
             if not auto_terminate_found:
                 print(f"    WARNING: AutoTerminate tag not found for instance {instance_id}")
             
-            # Check termination datetime tag
-            termination_datetime = None
-            termination_datetime_str = None
+            # Calculate termination time from launch time + configurable hours
+            # Note: In standalone lambda.py, using 336 hours (14 days) as default
+            # In CloudFormation, this uses the TerminationHours parameter
+            termination_hours = 336  # Default for standalone testing
+            print(f"    Calculating termination time from launch time + {termination_hours} hours")
             
-            for tag in tags:
-                if tag['Key'] == 'TerminationDateTime':
-                    termination_datetime_str = tag['Value']
-                    print(f"    ✓ Found TerminationDateTime tag: '{termination_datetime_str}'")
-                    try:
-                        termination_datetime = datetime.strptime(termination_datetime_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                        print(f"    ✓ Parsed termination datetime: {termination_datetime}")
-                    except ValueError as e:
-                        print(f"    ERROR: Failed to parse datetime '{termination_datetime_str}': {str(e)}")
-                        print(f"    Expected format: YYYY-MM-DD HH:MM:SS")
-                        continue
-                    break
-            
-            if not termination_datetime_str:
-                print(f"    WARNING: No TerminationDateTime tag found for instance {instance_id}")
-                continue
-            
-            if not termination_datetime:
-                print(f"    WARNING: Could not parse TerminationDateTime for instance {instance_id}")
+            launch_time = instance.get('LaunchTime')
+            if launch_time:
+                # Convert launch_time to UTC datetime if it's not already
+                if hasattr(launch_time, 'replace'):
+                    launch_datetime = launch_time.replace(tzinfo=timezone.utc)
+                else:
+                    launch_datetime = launch_time
+                
+                # Add termination hours to launch time
+                termination_datetime = launch_datetime + timedelta(hours=termination_hours)
+                print(f"    Launch time: {launch_datetime}")
+                print(f"    Calculated termination time: {termination_datetime}")
+            else:
+                print(f"    ERROR: No launch time found for instance {instance_id}")
                 continue
             
             # Compare times

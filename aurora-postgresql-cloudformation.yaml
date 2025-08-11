@@ -223,11 +223,12 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt AutoTerminationRole.Arn
+      Timeout: 300
       Code:
         ZipFile: |
           import boto3
           import json
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
           
           def lambda_handler(event, context):
               rds = boto3.client('rds')
@@ -248,13 +249,23 @@ Resources:
                       tags = {tag['Key']: tag['Value'] for tag in tags_response['TagList']}
                       
                       if tags.get('AutoTerminate') == 'true':
-                          # Check termination datetime tag
-                          termination_datetime = None
-                          if 'TerminationDateTime' in tags:
-                              try:
-                                  termination_datetime = datetime.strptime(tags['TerminationDateTime'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-                              except ValueError:
-                                  continue
+                          # Calculate termination time from cluster creation time + TerminationHours parameter
+                          termination_hours = ${TerminationHours}
+                          cluster_create_time = cluster.get('ClusterCreateTime')
+                          if cluster_create_time:
+                              # Convert to UTC datetime if it's not already
+                              if hasattr(cluster_create_time, 'replace'):
+                                  create_datetime = cluster_create_time.replace(tzinfo=timezone.utc)
+                              else:
+                                  create_datetime = cluster_create_time
+                              
+                              # Add TerminationHours parameter to creation time
+                              from datetime import timedelta
+                              termination_datetime = create_datetime + timedelta(hours=termination_hours)
+                              print(f"Cluster {cluster_id} created: {create_datetime}, terminates in {termination_hours} hours: {termination_datetime}")
+                          else:
+                              print(f"ERROR: No creation time found for cluster {cluster_id}")
+                              continue
                           
                           if termination_datetime and current_datetime >= termination_datetime:
                               clusters_to_terminate.append(cluster_id)
@@ -313,103 +324,7 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt AutoTerminationSchedule.Arn
 
-  # Custom Resource to set termination datetime
-  SetTerminationDateTimeRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: RDSTaggingPolicy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - rds:AddTagsToResource
-                  - rds:DescribeDBClusters
-                Resource: '*'
 
-  SetTerminationDateTimeFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub '${AWS::StackName}-set-termination-datetime'
-      Runtime: python3.9
-      Handler: index.lambda_handler
-      Role: !GetAtt SetTerminationDateTimeRole.Arn
-      Code:
-        ZipFile: |
-          import boto3
-          import json
-          import cfnresponse
-          from datetime import datetime, timedelta
-          import time
-          
-          def lambda_handler(event, context):
-              try:
-                  if event['RequestType'] == 'Create':
-                      rds = boto3.client('rds')
-                      
-                      cluster_id = event['ResourceProperties']['ClusterIdentifier']
-                      region = event['ResourceProperties']['Region']
-                      account_id = event['ResourceProperties']['AccountId']
-                      termination_hours = int(event['ResourceProperties']['TerminationHours'])
-                      
-                      # Wait for cluster to be available
-                      max_attempts = 30
-                      for attempt in range(max_attempts):
-                          try:
-                              response = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
-                              cluster = response['DBClusters'][0]
-                              if cluster['Status'] == 'available':
-                                  cluster_arn = cluster['DBClusterArn']
-                                  break
-                              print(f"Cluster status: {cluster['Status']}, waiting...")
-                              time.sleep(30)
-                          except Exception as e:
-                              print(f"Attempt {attempt + 1}: {str(e)}")
-                              if attempt == max_attempts - 1:
-                                  raise
-                              time.sleep(30)
-                      
-                      # Calculate termination datetime
-                      termination_datetime = datetime.utcnow() + timedelta(hours=termination_hours)
-                      termination_datetime_str = termination_datetime.strftime('%Y-%m-%d %H:%M:%S')
-                      
-                      # Add termination datetime tag
-                      rds.add_tags_to_resource(
-                          ResourceName=cluster_arn,
-                          Tags=[
-                              {
-                                  'Key': 'TerminationDateTime',
-                                  'Value': termination_datetime_str
-                              }
-                          ]
-                      )
-                      
-                      print(f"Set termination datetime for {cluster_arn}: {termination_datetime_str}")
-                  
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-              except Exception as e:
-                  print(f"Error: {str(e)}")
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
-
-  SetTerminationDateTime:
-    Type: AWS::CloudFormation::CustomResource
-    DependsOn: AuroraInstance
-    Properties:
-      ServiceToken: !GetAtt SetTerminationDateTimeFunction.Arn
-      ClusterIdentifier: !Ref AuroraCluster
-      Region: !Ref Region
-      AccountId: !Ref AWS::AccountId
-      TerminationHours: !Ref TerminationHours
 
 Outputs:
   ClusterIdentifier:
