@@ -1,1 +1,1 @@
-{"statusCode": 200, "body": "{\"message\": \"Processed 0 instances for termination\", \"instances_found\": [\"i-039946cde323958f2\"], \"instances_terminated\": [], \"current_time\": \"2025-08-11 09:01:17.438616+00:00\"}"}
+{"statusCode": 200, "body": "\"Processed 0 clusters for termination\""}
