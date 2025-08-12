@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'G5 instance with auto-termination after 2 weeks'
+Description: 'G5 instance with auto-termination'
 
 Parameters:
   InstanceType:
@@ -129,6 +129,9 @@ Resources:
       Handler: index.lambda_handler
       Role: !GetAtt AutoTerminationRole.Arn
       Timeout: 300
+      Environment:
+        Variables:
+          TERMINATION_HOURS: !Ref TerminationHours
       Code:
         ZipFile: |
           import boto3
@@ -192,7 +195,8 @@ Resources:
                           print(f"    WARNING: AutoTerminate tag not found for instance {instance_id}")
                       
                       # Calculate termination time from launch time + TerminationHours parameter
-                      termination_hours = int('${TerminationHours}')
+                      import os
+                      termination_hours = int(os.environ.get('TERMINATION_HOURS', '336'))
                       print(f"    Calculating termination time from launch time + {termination_hours} hours")
                       
                       launch_time = instance.get('LaunchTime')

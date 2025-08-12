@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Aurora PostgreSQL cluster with auto-termination after 2 weeks'
+Description: 'Aurora PostgreSQL cluster with auto-termination'
 
 Parameters:
   Region:
@@ -224,6 +224,9 @@ Resources:
       Handler: index.lambda_handler
       Role: !GetAtt AutoTerminationRole.Arn
       Timeout: 300
+      Environment:
+        Variables:
+          TERMINATION_HOURS: !Ref TerminationHours
       Code:
         ZipFile: |
           import boto3
@@ -250,7 +253,8 @@ Resources:
                       
                       if tags.get('AutoTerminate') == 'true':
                           # Calculate termination time from cluster creation time + TerminationHours parameter
-                          termination_hours = int('${TerminationHours}')
+                          import os
+                          termination_hours = int(os.environ.get('TERMINATION_HOURS', '336'))
                           cluster_create_time = cluster.get('ClusterCreateTime')
                           if cluster_create_time:
                               # Convert to UTC datetime if it's not already
